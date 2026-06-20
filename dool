@@ -30,6 +30,7 @@ import fnmatch
 import getopt
 import getpass
 import glob
+import json
 import linecache
 import math
 import os
@@ -76,12 +77,15 @@ class Options:
         self.devel         = 0
         self.disklist      = []
         self.diskset       = {}
+        self.netlist       = None
+        self.netset        = {}
+        self.swaplist      = None
+        self.strict_plugin = False
+        self.output_format = 'csv'
         self.full          = False
         self.float         = False
         self.integer       = False
         self.intlist       = None
-        self.netlist       = None
-        self.swaplist      = None
         self.color         = None
         self.update        = True
         self.header        = True
@@ -91,6 +95,8 @@ class Options:
         self.use_ascii     = False
         self.plugin_params = {} # Not currently used
         self.opt_params    = {} # CLI arguments that *optionally* have a param
+        self.profile_times      = {}
+        self.profile_total = {}
 
         # See if any of the CLI arguments are "optional" and remove them
         # getopt() doesn't support optional params, so we remove them so getopt()
@@ -117,11 +123,11 @@ class Options:
             'all'      , 'all-plugins', 'ascii'   , 'bits'   , 'bw'     , 'bytes'  , 'black-on-white', 'color'  ,
             'color16'  , 'defaults'   , 'debug'   , 'devel'  , 'display', 'dstat'  , 'filesystem'    , 'float'  ,
             'full'     , 'help'       , 'integer' , 'list'   , 'mods'   , 'modules', 'more'          , 'nocolor',
-            'noheaders', 'noupdate'   , 'profile' , 'version', 'vmstat' ,
+            'noheaders', 'noupdate'   , 'profile' , 'version', 'vmstat' , 'strict-plugin',
         ]
 
         param_opts = [
-            'diskset=' , 'output='    , 'pidfile='
+            'diskset=' , 'output='    , 'pidfile=' , 'netset='
         ]
 
         all_opts = (long_opts + param_opts + plugin_opt_list)
@@ -176,6 +182,27 @@ class Options:
 
                 self.diskset[name] = cleaned
                 self.disklist.append(name)
+            elif opt in ['--netset']:
+                parts   = arg.split(":", 1)
+                name    = list_item_default(parts, 0, "Unknown")
+                members = list_item_default(parts, 1, "").split(",")
+
+                if (len(parts) < 2 or len(members) < 1):
+                    print("Error parsing netset...\n", file=sys.stderr)
+                    print("Format : netset_name:iface1,iface2,iface3,etc...\n", file=sys.stderr)
+                    print("Example: --netset my_nets:eth0,eth1,wlan0\n", file=sys.stderr)
+
+                cleaned = [m.strip() for m in members if m.strip()]
+
+                if len(cleaned) == 0:
+                    print('dool: netset %s has no valid members' % name, file=sys.stderr)
+
+                self.netset[name] = cleaned
+                if self.netlist is None:
+                    self.netlist = []
+                self.netlist.append(name)
+            elif opt in ['--strict-plugin']:
+                self.strict_plugin = True
             elif opt in ['--dstat']:
                 self.bits      = False
                 self.use_ascii = True
@@ -266,6 +293,19 @@ class Options:
             elif opt in ['-o', '--output']:
                 self.output = arg
                 self.display = False
+                ext = os.path.splitext(arg)[1].lower()
+                if ext == '.json':
+                    if self.output and self.output_format != 'json':
+                        print('dool: output format overridden to json by --output %s' % arg, file=sys.stderr)
+                    self.output_format = 'json'
+                elif ext == '.jsonl':
+                    if self.output and self.output_format != 'jsonl':
+                        print('dool: output format overridden to jsonl by --output %s' % arg, file=sys.stderr)
+                    self.output_format = 'jsonl'
+                else:
+                    if self.output and self.output_format != 'csv':
+                        print('dool: output format overridden to csv by --output %s' % arg, file=sys.stderr)
+                    self.output_format = 'csv'
             elif opt in ['--display']:
                 self.display = True
             elif opt in ['--pidfile']:
@@ -323,6 +363,35 @@ class Options:
 
         if self.debug:
             print('Plugins: %s' % self.plugins)
+
+        self._load_netsets_conf()
+
+    def _load_netsets_conf(self):
+        conf_path = os.path.expanduser('~/.dool/netsets.conf')
+        try:
+            if not os.path.exists(conf_path):
+                return
+            with open(conf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    try:
+                        parts = line.split(':', 1)
+                        if len(parts) != 2:
+                            print('dool: warning: skipping malformed netsets.conf line: %s' % line, file=sys.stderr)
+                            continue
+                        name = parts[0].strip()
+                        members = [m.strip() for m in parts[1].split(',') if m.strip()]
+                        if not name or not members:
+                            print('dool: warning: skipping malformed netsets.conf line: %s' % line, file=sys.stderr)
+                            continue
+                        if name not in self.netset:
+                            self.netset[name] = members
+                    except Exception as e:
+                        print('dool: warning: error parsing netsets.conf line: %s (%s)' % (line, e), file=sys.stderr)
+        except Exception as e:
+            print('dool: warning: failed to load netsets.conf: %s' % e, file=sys.stderr)
 
     # Loop through the args array and find any items that are optional. If we
     # find an optional one, check the NEXT item. If the next item does NOT
@@ -442,6 +511,7 @@ Dool options:
   -m, --mem                enable memory stats
   -n, --net                enable network stats
      -N eth1,total            include eth1 and total
+     --netset name:eth0,eth1  group network interfaces together for aggregate stats
   -p, --proc               enable process stats
   -r, --io                 enable io stats (I/O requests completed)
   -s, --swap               enable swap stats
@@ -483,10 +553,11 @@ Dool options:
   --nocolor                disable colors
   --noheaders              disable repetitive headers
   --noupdate               disable intermediate updates
-  --output file            write CSV output to file
+  --output file            write output to file (.csv, .json, .jsonl auto-detected)
   --display                output to the display (useful with --output)
   --profile                show profiling statistics when exiting dool
   --ascii                  output table data in ascii instead of ANSI
+  --strict-plugin          exit on any plugin health check failure
 
 delay is the delay in seconds between each update (default: 1)
 count is the number of updates to display before exiting (default: unlimited)
@@ -1281,12 +1352,18 @@ class dool_net(dool):
     def vars(self):
         ret = []
         if op.netlist:
-            varlist = op.netlist
+            varlist = []
+            for x in op.netlist:
+                if x in op.netset:
+                    for iface in op.netset[x]:
+                        if iface not in varlist:
+                            varlist.append(iface)
+                else:
+                    varlist.append(x)
         elif not op.full:
             varlist = ('total',)
         else:
             varlist = self.discover
-#           if len(varlist) > 2: varlist = varlist[0:2]
             varlist.sort()
         for name in varlist:
             if name in self.discover + ['total', 'lo']:
@@ -1649,22 +1726,95 @@ class dool_zones(dool):
 
 # Handle catching CTRL + C when we quit
 def signal_handler(signum, frame):
-    #print("%s\n\nWe caught signal #%d!" % (fg_color(15), signum))
+    try:
+        finalize_output()
+    except Exception:
+        pass
 
-    # If we're outputting to a file do some cleanup
-    if op.output:
-        outputfile.flush()
-
-    # If we're outputting to the display
-    if op.display:
-        # Print a couple of spaces to cover up the "^C" that gets printed
-        sys.stdout.write("\b\b        ")
-        # Reset the ANSI colors just in case
-        sys.stdout.write(ansi['reset'])
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    try:
+        if op.display:
+            sys.stdout.write("\b\b        ")
+            sys.stdout.write(ansi['reset'])
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+    except Exception:
+        pass
 
     sys.exit(0)
+
+def finalize_output():
+    global json_wrote_first, step_counter
+    try:
+        if not op or not op.output:
+            return
+    except NameError:
+        return
+    try:
+        if op.profile and op.output and step_counter > 0:
+            avg_profile = {}
+            for pname, total_ms in op.profile_total.items():
+                avg_profile[pname] = total_ms / step_counter
+            total_all = sum(avg_profile.values())
+
+            if op.output_format == 'csv':
+                total_cols = 0
+                try:
+                    for o in totlist:
+                        for i, vname in enumerate(o.vars):
+                            if o.cols > 0:
+                                total_cols += o.cols
+                            else:
+                                total_cols += 1
+                        if o is not totlist[-1]:
+                            total_cols += 1
+                except Exception:
+                    pass
+                total_cols = max(total_cols, 2)
+
+                outputfile.write('\n')
+                outputfile.write('[profile]\n')
+
+                header_line = 'profile_total_ms'
+                for _ in range(total_cols - 2):
+                    header_line += char['sep']
+                header_line += char['sep'] + 'per_plugin_ms'
+                outputfile.write(header_line + '\n')
+
+                per_plugin_str = json.dumps(avg_profile)
+                data_line = '%.3f' % total_all
+                for _ in range(total_cols - 2):
+                    data_line += char['sep']
+                data_line += char['sep'] + '"' + per_plugin_str.replace('"', '""') + '"'
+                outputfile.write(data_line + '\n')
+
+            elif op.output_format == 'json':
+                if json_wrote_first:
+                    outputfile.write('\n')
+                outputfile.write('],\n"profile": {\n')
+                outputfile.write('  "profile_total_ms": %.3f,\n' % total_all)
+                outputfile.write('  "per_plugin_ms": {\n')
+                items = list(avg_profile.items())
+                for i, (pname, ms) in enumerate(items):
+                    comma = ',' if i < len(items) - 1 else ''
+                    outputfile.write('    "%s": %.3f%s\n' % (pname, ms, comma))
+                outputfile.write('  }\n')
+                outputfile.write('}\n')
+
+            elif op.output_format == 'jsonl':
+                pass
+
+        elif op.output_format == 'json':
+            if json_wrote_first:
+                outputfile.write('\n')
+            outputfile.write(']}\n')
+
+        outputfile.flush()
+        outputfile.close()
+    except Exception as e:
+        try:
+            print('dool: warning: error finalizing output: %s' % e, file=sys.stderr)
+        except Exception:
+            pass
 
 # Configure which signals to listen for
 def init_signal_handling():
@@ -2317,6 +2467,64 @@ def csv_header(totlist):
             line = line + char['sep']
     return line + '\n'
 
+def get_plugin_name_for_json(o):
+    name = plugin_obj_name(o)
+    return name
+
+def build_json_sample(totlist, timestamp=None, profile_data=None):
+    sample = {}
+    if timestamp is not None:
+        sample['timestamp'] = timestamp
+
+    for o in totlist:
+        if hasattr(o, '_json_key'):
+            pkey = o._json_key
+        else:
+            pname = get_plugin_name_for_json(o)
+            pname = pname.replace('-', '_')
+            pkey = re.sub(r'[^\w]', '_', pname)
+        plugin_data = {}
+
+        if isinstance(o.name, list) and len(o.name) > 1 and hasattr(o, 'nick'):
+            for i, vname in enumerate(o.vars):
+                if isinstance(o.val[vname], (list, tuple)):
+                    for j, nick in enumerate(o.nick):
+                        col_name = vname + '_' + nick
+                        plugin_data[col_name] = o.val[vname][j]
+                else:
+                    plugin_data[vname] = o.val[vname]
+        else:
+            for i, vname in enumerate(o.vars):
+                if isinstance(o.val[vname], (list, tuple)):
+                    for j, val in enumerate(o.val[vname]):
+                        if hasattr(o, 'nick') and j < len(o.nick):
+                            col_name = o.nick[j]
+                        else:
+                            col_name = str(j)
+                        plugin_data[col_name] = val
+                else:
+                    if hasattr(o, 'nick') and i < len(o.nick):
+                        col_name = o.nick[i]
+                    else:
+                        col_name = vname
+                    plugin_data[col_name] = o.val[vname]
+
+        sample[pkey] = plugin_data
+
+    if profile_data:
+        sample['_profile'] = profile_data
+
+    return sample
+
+def get_timestamp_for_json(totlist):
+    for o in totlist:
+        pname = get_plugin_name_for_json(o)
+        if 'time' in pname.lower() or pname == 'system':
+            if hasattr(o, 'val') and 'time' in o.val:
+                return o.val['time']
+    global step_counter, startup_time
+    return startup_time + step_counter
+
 def info(level, msg):
     "Output info message"
 #   if level <= op.verbose:
@@ -2329,21 +2537,34 @@ def die(ret, msg):
 
 # Quit in a clean way
 def exit(ret):
-    sys.stdout.write(ansi['reset'])
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(ansi['reset'])
+        sys.stdout.flush()
+    except Exception:
+        pass
 
-    # Remove any pidfiles
-    if op.pidfile and os.path.exists(op.pidfile):
-        os.remove(op.pidfile)
+    try:
+        if op.pidfile and os.path.exists(op.pidfile):
+            os.remove(op.pidfile)
+    except Exception:
+        pass
 
-    if op.profile and os.path.exists(op.profile):
-        rows, cols = get_term_size()
-        import pstats
+    try:
+        finalize_output()
+    except Exception:
+        pass
 
-        p = pstats.Stats(op.profile)
-        p.sort_stats('cumulative').print_stats(rows - 13)
-    elif op.profile:
-        print('No profiling data was found, maybe profiler was interrupted ?', file=sys.stderr)
+    try:
+        if op.profile and os.path.exists(op.profile):
+            rows, cols = get_term_size()
+            import pstats
+
+            p = pstats.Stats(op.profile)
+            p.sort_stats('cumulative').print_stats(rows - 13)
+        elif op.profile:
+            print('No profiling data was found, maybe profiler was interrupted ?', file=sys.stderr)
+    except Exception:
+        pass
 
     sys.exit(ret)
 
@@ -2772,6 +2993,8 @@ def main():
     global ansi, theme, outputfile
     global totlist, inittime
     global update, missed
+    global json_wrote_first
+    global startup_time, step_counter
 
     devel_log("Dool startup")
 
@@ -2805,24 +3028,37 @@ def main():
         for key in char_box_draw:
             char[key] = char_box_draw[key]
 
-    ### Prepare CSV output file (unbuffered)
+    ### Prepare output file
+    json_wrote_first = False
+    startup_time = int(time.time())
+    step_counter = 0
+
     if op.output:
         if not os.path.exists(op.output):
             outputfile = open(op.output, 'w')
-            outputfile.write('"dool %s CSV output"\n' % __version__)
-            header = ('"Author:","Scott Baker"','','','','"URL:"','"https://github.com/scottchiefbaker/dool/"\n')
-            outputfile.write(char['sep'].join(header))
+            if op.output_format == 'csv':
+                outputfile.write('"dool %s CSV output"\n' % __version__)
+                header = ('"Author:","Scott Baker"','','','','"URL:"','"https://github.com/scottchiefbaker/dool/"\n')
+                outputfile.write(char['sep'].join(header))
+            elif op.output_format == 'json':
+                outputfile.write('{"samples": [\n')
+            # JSONL doesn't need a header
         else:
             outputfile = open(op.output, 'a')
-            outputfile.write('\n\n')
+            if op.output_format == 'csv':
+                outputfile.write('\n\n')
+            elif op.output_format == 'json':
+                # If appending to JSON, we need to handle it carefully
+                # For simplicity, just write a comma and continue
+                outputfile.write(',\n')
 
-        header = ('"Host:"','"%s"' % hostname,'','','','"User:"','"%s"\n' % user)
-        outputfile.write(char['sep'].join(header))
+        if op.output_format == 'csv':
+            header = ('"Host:"','"%s"' % hostname,'','','','"User:"','"%s"\n' % user)
+            outputfile.write(char['sep'].join(header))
 
-        run_cmd = " ".join(sys.argv)
-
-        header = ('"Cmdline:"','"' + run_cmd + '"','','','','"Date:"','"%s"\n' % time.strftime('%d %b %Y %H:%M:%S %Z', time.localtime()))
-        outputfile.write(char['sep'].join(header))
+            run_cmd = " ".join(sys.argv)
+            header = ('"Cmdline:"','"' + run_cmd + '"','','','','"Date:"','"%s"\n' % time.strftime('%d %b %Y %H:%M:%S %Z', time.localtime()))
+            outputfile.write(char['sep'].join(header))
 
     ### Create pidfile
     if op.pidfile:
@@ -2860,16 +3096,20 @@ def main():
     ### Build list of requested plugins
     linewidth = 0
     totlist   = []
+    total_plugins = 0
+    failed_plugins = 0
 
     for plugin in op.plugins:
         pluginfile = op.plugin_details[plugin]['file']
+        plugintype = op.plugin_details[plugin]['type']
+        total_plugins += 1
+        plugin_failed = False
+        fail_reason = ''
 
         try:
             if pluginfile not in globals():
                 scope = {}
 
-                # Load the plugin body into a string and then 'exec' the code
-                # into the global namespace
                 plugin_str = open(pluginfile).read()
                 code       = compile(plugin_str, pluginfile, 'exec')
                 exec(code, globals(), scope)
@@ -2883,25 +3123,53 @@ def main():
                 plug.check()
                 plug.prepare()
 
+            json_key = re.sub(r'[^\w]', '_', plugin.replace('-', '_'))
+            plug._json_key = json_key
+
+            try:
+                plug.extract()
+                if not isinstance(plug.val, dict):
+                    plugin_failed = True
+                    fail_reason = 'extract() did not produce a dict, got %s' % type(plug.val).__name__
+                else:
+                    expected_keys = len(plug.vars)
+                    actual_keys = len(plug.val)
+                    if actual_keys != expected_keys:
+                        plugin_failed = True
+                        fail_reason = 'extract() produced dict with %d keys, expected %d (vars)' % (actual_keys, expected_keys)
+            except Exception as e:
+                plugin_failed = True
+                fail_reason = 'extract() raised exception: %s' % str(e)
+
         except Exception as err_str:
+            plugin_failed = True
+            fail_reason = str(err_str)
             if op.debug >= 3:
                 raise
+
+        if plugin_failed:
+            failed_plugins += 1
+            if plugintype == 'builtin':
+                src_label = '(builtin)'
             else:
-                print('%sPlugin %s failed to load. (%s)' % (text_color(208, "Warning: "), text_color(15, pluginfile), err_str), file=sys.stderr)
-
+                src_label = pluginfile
+            print('[plugin-fail] %s %s: %s' % (plugin, src_label, fail_reason), file=sys.stderr)
+            if op.strict_plugin:
+                sys.exit(2)
             continue
-
-        except:
-            print('Module %s caused unknown exception' % pluginfile, file=sys.stderr)
 
         linewidth = linewidth + plug.statwidth() + 1
         totlist.append(plug)
+
+    if total_plugins > 0 and failed_plugins > total_plugins / 2:
+        print('[plugin-fail] %d of %d plugins unhealthy, output may be incomplete' % (failed_plugins, total_plugins), file=sys.stderr)
 
     if not totlist:
         die(8, 'None of the stats you selected are available.')
 
     if op.output:
-        outputfile.write(csv_header(totlist))
+        if op.output_format == 'csv':
+            outputfile.write(csv_header(totlist))
 
     scheduler = sched.scheduler(time.time, time.sleep)
     inittime  = time.time()
@@ -2930,15 +3198,13 @@ def perform(update):
         global totlist, oldvislist, vislist, showheader, rows, cols
         global elapsed, totaltime, starttime
         global loop, step, missed
+        global json_wrote_first, step_counter
 
         starttime = time.time()
 
-        # The number of the current loop (not counting subdates)
         loop = int((update - 1 + op.delay) / op.delay)
-        # The step (subupdate) number inside of the current loop
         step = ((update - 1) % op.delay) + 1
 
-        ### Get current time (may be different from schedule) for debugging
         if not op.debug:
             curwidth = 0
         else:
@@ -2946,13 +3212,10 @@ def perform(update):
                 totaltime = 0
             curwidth = 8
 
-        ### FIXME: This is temporary functionality, we should do this better
-        ### If it takes longer than 500ms, than warn !
         if loop != 0 and starttime - inittime - update > 1:
             missed = missed + 1
             return 0
 
-        ### Initialise certain variables
         if loop == 0:
             elapsed = ticks()
             rows, cols = 0, 0
@@ -2962,12 +3225,10 @@ def perform(update):
         else:
             elapsed = step
 
-        ### FIXME: Make this part smarter
         if sys.stdout.isatty():
             oldcols = cols
             rows, cols = get_term_size()
 
-            ### Trim object list to what is visible on screen
             if oldcols != cols:
                 vislist = []
                 for o in totlist:
@@ -2976,7 +3237,6 @@ def perform(update):
                         vislist.append(o)
                         curwidth = newwidth
 
-            ### Check when to display the header
             if op.header and rows >= 6:
                 if oldvislist != vislist:
                     showheader = True
@@ -2989,26 +3249,20 @@ def perform(update):
         else:
             vislist = totlist
 
-        # If we're on the last step of the loop it's definitive and is colored differently
         if step == op.delay:
             theme['default'] = ansi['reset']
-        # It's a step/subupdate
         else:
             theme['default'] = theme['text_lo']
 
-        ### The first step is to show the definitive line if necessary
         newline = ''
         if op.update:
-            ### If we are starting a whole new line we \n and reset
             if step == 1 and update != 0:
                 newline = '\n' + ansi['reset'] + ansi['clearline']
-            ### If we're in a delay we just go to column 0 and overwrite what's there
             elif loop != 0:
                 newline = ansi['clearline'] + ansi['column_zero'];
         elif not op.update:
             newline = "\n"
 
-        ### Display header
         if showheader:
             if loop == 0 and totlist != vislist:
                 print('Terminal width too small, trimming output.', file=sys.stderr)
@@ -3016,34 +3270,65 @@ def perform(update):
             sys.stdout.write(newline)
             newline = header(totlist, vislist)
 
-        ### Calculate all objects (visible, invisible)
         line = newline
         oline = ''
+        step_profile = {}
 
         devel_log("Starting plugins")
-        # Loop through each param section and build the output string
         for o in totlist:
+            if op.profile and op.output:
+                if hasattr(o, '_json_key'):
+                    pname_key = o._json_key
+                else:
+                    pname = get_plugin_name_for_json(o)
+                    pname_key = re.sub(r'[^\w]', '_', pname.replace('-', '_'))
+                pstart = time.time()
+
             o.extract()
+
+            if op.profile and op.output:
+                pend = time.time()
+                elapsed_ms = (pend - pstart) * 1000.0
+                step_profile[pname_key] = elapsed_ms
+                if pname_key not in op.profile_total:
+                    op.profile_total[pname_key] = 0.0
+                op.profile_total[pname_key] += elapsed_ms
 
             devel_log("Plugin: '%s'" % (plugin_obj_name(o)))
 
             if o in vislist:
                 line = line + o.show() + o.showend(totlist, vislist)
 
-            # Prep the line for the CSV file
             if op.output and step == op.delay:
-                oline = oline + o.showcsv() + o.showcsvend(totlist, vislist)
+                if op.output_format == 'csv':
+                    oline = oline + o.showcsv() + o.showcsvend(totlist, vislist)
 
-        ### Put the output in the csv file
         if op.output and step == op.delay:
-            outputfile.write(oline + '\n')
-            outputfile.flush()
+            step_counter += 1
+            if op.output_format == 'csv':
+                outputfile.write(oline + '\n')
+                outputfile.flush()
+            elif op.output_format in ('json', 'jsonl'):
+                ts = get_timestamp_for_json(totlist)
+                prof_data = None
+                if op.profile:
+                    total_ms = sum(step_profile.values())
+                    step_profile_copy = dict(step_profile)
+                    step_profile_copy['_total_ms'] = total_ms
+                    prof_data = step_profile_copy
+                sample = build_json_sample(totlist, timestamp=ts, profile_data=prof_data)
+                if op.output_format == 'jsonl':
+                    outputfile.write(json.dumps(sample) + '\n')
+                else:
+                    if json_wrote_first:
+                        outputfile.write(',\n')
+                    outputfile.write(json.dumps(sample, indent=2))
+                    json_wrote_first = True
+                outputfile.flush()
 
-        ### Print stats to display
         if op.display:
             sys.stdout.write(line + theme['input'])
 
-        ### Print debugging output
         if op.debug:
             totaltime = totaltime + (time.time() - starttime) * 1000.0
             if loop == 0:
@@ -3056,7 +3341,6 @@ def perform(update):
                 sys.stdout.write('%s%6.2f %s%d:%d:%d%s' % (theme['roundtrip'], totaltime / step, theme['debug'], loop, step, update, theme['input']))
 
         if missed > 0:
-            # sys.stdout.write(' '+theme['error']+'= warn =')
             sys.stdout.write(' ' + theme['error'] + 'missed ' + str(missed+1) + ' ticks' + theme['input'])
             missed = 0
 
