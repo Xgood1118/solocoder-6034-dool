@@ -35,12 +35,77 @@ import linecache
 import math
 import os
 import re
-import resource
 import sched
 import sys
 import time
 import signal
 import sysconfig
+
+# resource is Unix-only; use portable fallback for getpagesize()
+try:
+    import resource
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False
+
+def get_pagesize():
+    if _HAS_RESOURCE:
+        return resource.getpagesize()
+    try:
+        if os.name == 'nt':
+            import ctypes
+            class SYSTEM_INFO(ctypes.Structure):
+                _fields_ = [
+                    ("wProcessorArchitecture", ctypes.c_ushort),
+                    ("wReserved", ctypes.c_ushort),
+                    ("dwPageSize", ctypes.c_ulong),
+                    ("lpMinimumApplicationAddress", ctypes.c_void_p),
+                    ("lpMaximumApplicationAddress", ctypes.c_void_p),
+                    ("dwActiveProcessorMask", ctypes.c_ulonglong),
+                    ("dwNumberOfProcessors", ctypes.c_ulong),
+                    ("dwAllocationGranularity", ctypes.c_ulong),
+                    ("wProcessorLevel", ctypes.c_ushort),
+                    ("wProcessorRevision", ctypes.c_ushort),
+                ]
+            si = SYSTEM_INFO()
+            ctypes.windll.kernel32.GetSystemInfo(ctypes.byref(si))
+            return si.dwPageSize
+        return os.sysconf('SC_PAGE_SIZE')
+    except Exception:
+        return 4096
+
+def get_sysconf(name, default=None):
+    try:
+        return os.sysconf(name)
+    except (AttributeError, ValueError, OSError):
+        return default
+
+def get_uname():
+    try:
+        return os.uname()
+    except AttributeError:
+        import platform
+        class _Uname:
+            sysname  = platform.system() or 'Unknown'
+            nodename = platform.node() or 'Unknown'
+            release  = platform.release() or 'Unknown'
+            version  = platform.version() or 'Unknown'
+            machine  = platform.machine() or 'Unknown'
+        return _Uname()
+
+def get_hostname():
+    u = get_uname()
+    return u.nodename
+
+def get_cpu_count_sysconf():
+    nr = get_sysconf('SC_NPROCESSORS_ONLN')
+    if nr:
+        return nr
+    try:
+        import multiprocessing
+        return multiprocessing.cpu_count()
+    except Exception:
+        return 1
 
 from collections.abc import Sequence
 
@@ -476,7 +541,7 @@ class Options:
         print('Homepage at https://github.com/scottchiefbaker/dool/')
         print()
         print('Platform %s/%s' % (os.name, sys.platform))
-        print('Kernel %s' % os.uname().release)
+        print('Kernel %s' % get_uname().release)
         print('Python %s' % sys.version)
         print()
 
@@ -488,8 +553,8 @@ class Options:
         print('Terminal size: %d lines, %d columns' % (rows, cols))
         print()
         print('Processors   : %d' % getcpunr())
-        print('Pagesize     : %d' % resource.getpagesize())
-        print('Ticks per sec: %d' % os.sysconf('SC_CLK_TCK'))
+        print('Pagesize     : %d' % get_pagesize())
+        print('Ticks per sec: %s' % (get_sysconf('SC_CLK_TCK') or 'unknown'))
         print()
 
         global op
@@ -2012,7 +2077,7 @@ def set_theme():
 
 def ticks():
     "Return the number of 'ticks' since bootup"
-    if os.uname().sysname in ['Darwin', 'FreeBSD']:
+    if get_uname().sysname in ['Darwin', 'FreeBSD']:
         import subprocess
         boottime = subprocess.check_output(['sysctl', '-n', 'kern.boottime'])
         boottime = boottime.decode().split()[3:7]
@@ -2754,10 +2819,9 @@ def getcpunr():
     "Return the number of CPUs in the system"
 
     # POSIX
-    try:
-        return os.sysconf("SC_NPROCESSORS_ONLN")
-    except ValueError:
-        pass
+    nr = get_sysconf("SC_NPROCESSORS_ONLN")
+    if nr:
+        return nr
 
     # Python 2.6+
     try:
@@ -2996,7 +3060,7 @@ def main():
     global cpunr, hz, maxint, ownpid, pagesize
     global ansi, theme, outputfile
     global totlist, inittime
-    global update, missed
+    global update, missed, elapsed, step, loop, starttime
     global json_wrote_first
     global startup_time, step_counter
 
@@ -3006,14 +3070,14 @@ def main():
     init_signal_handling()
 
     cpunr  = getcpunr()
-    hz     = os.sysconf('SC_CLK_TCK')
+    hz     = get_sysconf('SC_CLK_TCK', 100)
     maxint = float("inf")
 
     ownpid   = str(os.getpid())
-    pagesize = resource.getpagesize()
+    pagesize = get_pagesize()
     interval = 1
     user     = getpass.getuser()
-    hostname = os.uname().nodename
+    hostname = get_hostname()
 
     ### Write term-title
     if sys.stdout.isatty():
@@ -3137,15 +3201,14 @@ def main():
     linewidth = 0
     totlist   = []
     total_plugins = 0
-    failed_plugins = 0
     used_json_keys = {}
+    plugin_sources = []
 
     for plugin in op.plugins:
         pluginfile = op.plugin_details[plugin]['file']
         plugintype = op.plugin_details[plugin]['type']
         total_plugins += 1
-        plugin_failed = False
-        fail_reason = ''
+        plugin_loaded_ok = False
 
         try:
             if pluginfile not in globals():
@@ -3172,57 +3235,120 @@ def main():
                 used_json_keys[base_key] = 1
                 json_key = base_key
             plug._json_key = json_key
-
-            try:
-                plug.extract()
-                if not isinstance(plug.val, dict):
-                    plugin_failed = True
-                    fail_reason = 'extract() did not produce a dict, got %s' % type(plug.val).__name__
-                else:
-                    expected_keys = len(plug.vars)
-                    actual_keys = len(plug.val)
-                    if actual_keys != expected_keys:
-                        plugin_failed = True
-                        fail_reason = 'extract() produced dict with %d keys, expected %d (vars)' % (actual_keys, expected_keys)
-            except Exception as e:
-                plugin_failed = True
-                fail_reason = 'extract() raised exception: %s' % str(e)
+            plugin_loaded_ok = True
 
         except Exception as err_str:
-            plugin_failed = True
-            fail_reason = str(err_str)
-            if op.debug >= 3:
-                raise
-
-        if plugin_failed:
-            failed_plugins += 1
+            reason = str(err_str)
             if plugintype == 'builtin':
                 src_label = '(builtin)'
             else:
                 src_label = pluginfile
-            print('[plugin-fail] %s %s: %s' % (plugin, src_label, fail_reason), file=sys.stderr)
+            print('[plugin-fail] %s %s: load/prepare failed: %s' % (plugin, src_label, reason), file=sys.stderr)
+            if op.debug >= 3:
+                raise
             if op.strict_plugin:
                 sys.exit(2)
             continue
 
-        linewidth = linewidth + plug.statwidth() + 1
-        totlist.append(plug)
-
-    if total_plugins > 0 and failed_plugins > total_plugins / 2:
-        print('[plugin-fail] %d of %d plugins unhealthy, output may be incomplete' % (failed_plugins, total_plugins), file=sys.stderr)
-
-    if not totlist:
-        die(8, 'None of the stats you selected are available.')
-
-    if op.output:
-        if op.output_format == 'csv':
-            outputfile.write(csv_header(totlist))
+        if plugin_loaded_ok:
+            linewidth = linewidth + plug.statwidth() + 1
+            totlist.append(plug)
+            plugin_sources.append((plugin, plugintype, pluginfile))
 
     scheduler = sched.scheduler(time.time, time.sleep)
     inittime  = time.time()
 
     update = 0
     missed = 0
+
+    # Initialize globals needed by plugin.extract() before health check
+    starttime = inittime
+    step = 1
+    loop = 0
+    elapsed = op.delay if op.delay else 1
+
+    ### Plugin Health Check (run after globals are initialized)
+    failed_plugins = 0
+    if totlist:
+        # Perform two warm-up passes with step == op.delay so that
+        # set1.update(set2) fires and primes the baseline. Many plugins
+        # need two samples to compute a valid diff.
+        for pass_idx in range(2):
+            step = op.delay
+            loop = pass_idx
+            starttime = time.time()
+            for idx, o in enumerate(totlist):
+                try:
+                    o.extract()
+                except Exception:
+                    pass
+
+        # Now do the real health check - fresh step values
+        step = op.delay
+        loop = 2
+        starttime = time.time()
+        passed_list = []
+        passed_sources = []
+        for idx, o in enumerate(totlist):
+            plugin, plugintype, pluginfile = plugin_sources[idx]
+            check_failed = False
+            fail_reason = ''
+
+            try:
+                o.extract()
+            except Exception as e:
+                check_failed = True
+                fail_reason = 'extract() raised exception: %s' % str(e)
+
+            if not check_failed:
+                if not isinstance(o.val, dict):
+                    check_failed = True
+                    fail_reason = 'extract() did not produce a dict, got %s' % type(o.val).__name__
+                else:
+                    expected_keys = len(o.vars)
+                    actual_keys = len(o.val)
+                    if actual_keys != expected_keys:
+                        check_failed = True
+                        fail_reason = 'extract() produced dict with %d keys, expected %d (vars)' % (actual_keys, expected_keys)
+
+            if check_failed:
+                failed_plugins += 1
+                if plugintype == 'builtin':
+                    src_label = '(builtin)'
+                else:
+                    src_label = pluginfile
+                print('[plugin-fail] %s %s: %s' % (plugin, src_label, fail_reason), file=sys.stderr)
+                if op.strict_plugin:
+                    sys.exit(2)
+            else:
+                passed_list.append(o)
+                passed_sources.append(plugin_sources[idx])
+
+        totlist[:] = passed_list
+        plugin_sources[:] = passed_sources
+
+    # Reset step/update before entering the real main loop
+    update = 0
+    step = 1
+    loop = 0
+    starttime = inittime
+
+    load_failed = total_plugins - len(plugin_sources)
+    total_health_failures = load_failed + failed_plugins
+    if total_plugins > 0 and total_health_failures > total_plugins / 2:
+        print('[plugin-fail] %d of %d plugins unhealthy, output may be incomplete' % (total_health_failures, total_plugins), file=sys.stderr)
+
+    if not totlist:
+        die(8, 'None of the stats you selected are available.')
+
+    # Recompute linewidth from surviving plugins
+    linewidth = 0
+    for o in totlist:
+        linewidth = linewidth + o.statwidth() + 1
+
+    if op.output:
+        if op.output_format == 'csv':
+            outputfile.write(csv_header(totlist))
 
     # This the main loop that does all the output. It has two options:
     # Loop X number of times where X is (delay * count) and stop
