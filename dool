@@ -164,10 +164,11 @@ class Options:
                 name    = list_item_default(parts, 0, "Unknown")
                 members = list_item_default(parts, 1, "").split(",")
 
-                if (len(parts) < 2 or len(members) < 1):
-                    print("Error parsing diskset...\n")
-                    print("Format : diskset_name:dev1,dev2,dev3,etc...")
-                    print("Example: --diskset os_drives:sda,sdb")
+                if (len(parts) < 2):
+                    print("Error parsing diskset...\n", file=sys.stderr)
+                    print("Format : diskset_name:dev1,dev2,dev3,etc...", file=sys.stderr)
+                    print("Example: --diskset os_drives:sda,sdb", file=sys.stderr)
+                    continue
 
                 # We convert /dev/sda and symlinks to their raw device name that is
                 # found in /proc/diskstats
@@ -178,7 +179,8 @@ class Options:
                         cleaned.append(base)
 
                 if len(cleaned) == 0:
-                    print('dool: diskset %s has no valid members' % name)
+                    print('dool: diskset %s has no valid members' % name, file=sys.stderr)
+                    continue
 
                 self.diskset[name] = cleaned
                 self.disklist.append(name)
@@ -187,15 +189,17 @@ class Options:
                 name    = list_item_default(parts, 0, "Unknown")
                 members = list_item_default(parts, 1, "").split(",")
 
-                if (len(parts) < 2 or len(members) < 1):
+                if (len(parts) < 2):
                     print("Error parsing netset...\n", file=sys.stderr)
                     print("Format : netset_name:iface1,iface2,iface3,etc...\n", file=sys.stderr)
                     print("Example: --netset my_nets:eth0,eth1,wlan0\n", file=sys.stderr)
+                    continue
 
                 cleaned = [m.strip() for m in members if m.strip()]
 
                 if len(cleaned) == 0:
                     print('dool: netset %s has no valid members' % name, file=sys.stderr)
+                    continue
 
                 self.netset[name] = cleaned
                 if self.netlist is None:
@@ -3044,13 +3048,49 @@ def main():
                 outputfile.write('{"samples": [\n')
             # JSONL doesn't need a header
         else:
-            outputfile = open(op.output, 'a')
-            if op.output_format == 'csv':
-                outputfile.write('\n\n')
-            elif op.output_format == 'json':
-                # If appending to JSON, we need to handle it carefully
-                # For simplicity, just write a comma and continue
-                outputfile.write(',\n')
+            if op.output_format == 'json':
+                # JSON append: detect existing structure and strip closing brackets
+                try:
+                    fsize = os.path.getsize(op.output)
+                    tail_size = min(fsize, 8192)
+                    rf = open(op.output, 'rb')
+                    rf.seek(max(0, fsize - tail_size))
+                    tail = rf.read().decode('utf-8', errors='replace')
+                    rf.close()
+
+                    # Look for the samples array closing: ] followed by optional ,profile or }
+                    # Search backwards for the last ']' that closes samples
+                    close_pos = -1
+                    stripped_tail = tail.rstrip()
+                    last_bracket = stripped_tail.rfind(']')
+                    if last_bracket >= 0:
+                        close_pos = last_bracket
+
+                    if close_pos >= 0:
+                        # Truncate the file to remove the closing, open in r+ mode
+                        tmpfile = open(op.output, 'r+b')
+                        actual_trunc_pos = max(0, fsize - tail_size) + close_pos
+                        tmpfile.seek(actual_trunc_pos)
+                        tmpfile.truncate()
+                        tmpfile.close()
+                        # Reopen in append text mode, json_wrote_first=True means
+                        # next sample will write a leading comma
+                        outputfile = open(op.output, 'a')
+                        json_wrote_first = True
+                    else:
+                        # Could not detect valid end, start fresh
+                        print('dool: warning: existing JSON output %s has unrecognized format, starting fresh' % op.output, file=sys.stderr)
+                        outputfile = open(op.output, 'w')
+                        outputfile.write('{"samples": [\n')
+                except Exception as e:
+                    print('dool: warning: error processing existing JSON file %s: %s, starting fresh' % (op.output, e), file=sys.stderr)
+                    outputfile = open(op.output, 'w')
+                    outputfile.write('{"samples": [\n')
+            else:
+                outputfile = open(op.output, 'a')
+                if op.output_format == 'csv':
+                    outputfile.write('\n\n')
+                # JSONL: no special handling, just append lines
 
         if op.output_format == 'csv':
             header = ('"Host:"','"%s"' % hostname,'','','','"User:"','"%s"\n' % user)
@@ -3098,6 +3138,7 @@ def main():
     totlist   = []
     total_plugins = 0
     failed_plugins = 0
+    used_json_keys = {}
 
     for plugin in op.plugins:
         pluginfile = op.plugin_details[plugin]['file']
@@ -3123,7 +3164,13 @@ def main():
                 plug.check()
                 plug.prepare()
 
-            json_key = re.sub(r'[^\w]', '_', plugin.replace('-', '_'))
+            base_key = re.sub(r'[^\w]', '_', plugin.replace('-', '_'))
+            if base_key in used_json_keys:
+                used_json_keys[base_key] += 1
+                json_key = '%s_%d' % (base_key, used_json_keys[base_key])
+            else:
+                used_json_keys[base_key] = 1
+                json_key = base_key
             plug._json_key = json_key
 
             try:
